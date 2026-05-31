@@ -12,16 +12,18 @@ full run (press any key to advance, 'q' to quit the preview early).
 import re
 from pathlib import Path
 
+import torch
 import cv2
 import numpy as np
 import pandas as pd
+from torchvision.ops import nms
 from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 PADDING           = 0.1   # expand each box edge by this fraction of box size
 CONF_FISH         = 0.01   # confidence threshold for class 0 (fish)
 CONF_PARTIAL_FISH = 0.09   # confidence threshold for class 1 (partial_fish)
-SAMPLE_MODE       = True   # process only SAMPLE_SIZE images + show overlay
+SAMPLE_MODE       = False   # process only SAMPLE_SIZE images + show overlay
 SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 
 # Leave empty to process the full split (or SAMPLE_SIZE images when SAMPLE_MODE=True).
@@ -30,6 +32,7 @@ SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 CUSTOM_IMAGES: list[str] = []
 
 IOU_THRESHOLD   = 0.5
+NMS_IOU_THRESHOLD = 0.5
 
 CLASS_MAP       = {0: "fish", 1: "partial_fish"}
 CONF_THRESHOLDS = {0: CONF_FISH, 1: CONF_PARTIAL_FISH}
@@ -43,19 +46,19 @@ SPLIT = "valid"
 # ───────────────────────────────────────────────────────────────────────────────
 
 
-def apply_filters(image: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    clahed = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-    clahed_then_blurred = cv2.GaussianBlur(clahed, (55, 55), 0)
-    sharpened = cv2.addWeighted(clahed, 1.8, clahed_then_blurred, -0.8, 0)
-    return sharpened
-
 # def apply_filters(image: np.ndarray) -> np.ndarray:
-#     return image
+#     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+#     l, a, b = cv2.split(lab)
+#     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#     cl = clahe.apply(l)
+#     limg = cv2.merge((cl, a, b))
+#     clahed = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+#     clahed_then_blurred = cv2.GaussianBlur(clahed, (55, 55), 0)
+#     sharpened = cv2.addWeighted(clahed, 1.8, clahed_then_blurred, -0.8, 0)
+#     return sharpened
+
+def apply_filters(image: np.ndarray) -> np.ndarray:
+    return image
 
 
 def iou_xywhn(b1: tuple, b2: tuple) -> float:
@@ -186,6 +189,17 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
                 if conf >= CONF_THRESHOLDS.get(cls_id, 1.0):
                     xc, yc, w, h = box.xywhn[0].tolist()
                     detections.append((cls_id, conf, xc, yc, w, h))
+
+        # Apply NMS across all detections regardless of class
+        if len(detections) > 1:
+            boxes_abs = torch.tensor([
+                [(xc - w / 2) * 640, (yc - h / 2) * 640,
+                 (xc + w / 2) * 640, (yc + h / 2) * 640]
+                for _, _, xc, yc, w, h in detections
+            ], dtype=torch.float32)
+            scores = torch.tensor([conf for _, conf, *_ in detections], dtype=torch.float32)
+            keep = nms(boxes_abs, scores, NMS_IOU_THRESHOLD)
+            detections = [detections[i] for i in keep.tolist()]
 
         vis = orig.copy() if SAMPLE_MODE else None
 

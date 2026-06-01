@@ -21,8 +21,8 @@ from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 PADDING           = 0.1   # expand each box edge by this fraction of box size
-CONF_FISH         = 0.01   # confidence threshold for class 0 (fish)
-CONF_PARTIAL_FISH = 0.09   # confidence threshold for class 1 (partial_fish)
+CONF_FISH         = 0.04   # confidence threshold for class 0 (fish)
+CONF_PARTIAL_FISH = 0.12  # confidence threshold for class 1 (partial_fish)
 SAMPLE_MODE       = False   # process only SAMPLE_SIZE images + show overlay
 SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 
@@ -31,14 +31,15 @@ SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 #   CUSTOM_IMAGES = ["frame_00042", "frame_01337"]
 CUSTOM_IMAGES: list[str] = []
 
-IOU_THRESHOLD   = 0.5
+IOU_THRESHOLD     = 0.5
 NMS_IOU_THRESHOLD = 0.5
+DEBUG_MODE        = False  # print per-detection matching info when True
 
 CLASS_MAP       = {0: "fish", 1: "partial_fish"}
 CONF_THRESHOLDS = {0: CONF_FISH, 1: CONF_PARTIAL_FISH}
 
 DATASETS = [
-    ("data12", "model12.pt"),
+    ("data15", "model15.pt"),
     # ("data15", "model15.pt"),
     # ("data25", "model25.pt"),
 ]
@@ -89,16 +90,31 @@ def load_gt(label_path: Path) -> list[tuple]:
     return boxes
 
 
-def assign_label(det: tuple, gt_boxes: list[tuple]) -> str:
-    """Return GT class_name for the highest-IoU match >= IOU_THRESHOLD, else 'background'."""
-    best_iou, best_cls = 0.0, None
-    for cls_id, gxc, gyc, gw, gh in gt_boxes:
-        score = iou_xywhn(det, (gxc, gyc, gw, gh))
-        if score > best_iou:
-            best_iou, best_cls = score, cls_id
-    if best_iou >= IOU_THRESHOLD and best_cls is not None:
-        return CLASS_MAP.get(best_cls, str(best_cls))
-    return "background"
+def assign_labels_greedy(
+    detections: list[tuple], gt_boxes: list[tuple]
+) -> list[str]:
+    """Greedy one-to-one matching mirroring YOLO's official evaluation.
+
+    Processes detections highest-confidence first; each GT box is matched
+    at most once. Returns labels in the same order as the input detections.
+    """
+    labels = ["background"] * len(detections)
+    matched_gt: set[int] = set()
+    order = sorted(range(len(detections)), key=lambda i: detections[i][1], reverse=True)
+    for det_idx in order:
+        _, _, xc, yc, w, h = detections[det_idx]
+        best_iou, best_gt_idx = 0.0, -1
+        for gt_idx, (_, gxc, gyc, gw, gh) in enumerate(gt_boxes):
+            if gt_idx in matched_gt:
+                continue
+            score = iou_xywhn((xc, yc, w, h), (gxc, gyc, gw, gh))
+            if score > best_iou:
+                best_iou, best_gt_idx = score, gt_idx
+        if best_iou >= IOU_THRESHOLD and best_gt_idx != -1:
+            gcls = gt_boxes[best_gt_idx][0]
+            labels[det_idx] = CLASS_MAP.get(gcls, str(gcls))
+            matched_gt.add(best_gt_idx)
+    return labels
 
 def expand_box(
     x1: float, y1: float, x2: float, y2: float,
@@ -167,7 +183,8 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
     for img_path in subset:
         stem = img_path.stem
 
-        results  = model(str(img_path), verbose=False)
+        results  = model(str(img_path), verbose=False,
+                         conf=min(CONF_THRESHOLDS.values()), max_det=1000)
         gt_boxes = load_gt(gt_label_dir / (stem + ".txt"))
 
         orig_path = orig_lookup.get(original_stem(stem))
@@ -201,10 +218,24 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
             keep = nms(boxes_abs, scores, NMS_IOU_THRESHOLD)
             detections = [detections[i] for i in keep.tolist()]
 
+        labels = assign_labels_greedy(detections, gt_boxes)
+
+        if DEBUG_MODE:
+            print(f"\n  [DEBUG] {img_path.name}")
+            print(f"    detections after NMS: {len(detections)}, GT boxes: {len(gt_boxes)}")
+            for i, (cls_id, conf, xc, yc, w, h) in enumerate(detections):
+                best_iou = max(
+                    (iou_xywhn((xc, yc, w, h), (gxc, gyc, gw, gh))
+                     for _, gxc, gyc, gw, gh in gt_boxes),
+                    default=0.0,
+                )
+                print(f"    det[{i}] conf={conf:.4f} class={CLASS_MAP.get(cls_id, str(cls_id))} "
+                      f"label={labels[i]} best_iou={best_iou:.4f}")
+
         vis = orig.copy() if SAMPLE_MODE else None
 
         idx = crop_counter.get(stem, 0)
-        for cls_id, conf, xc, yc, w, h in detections:
+        for (cls_id, conf, xc, yc, w, h), label in zip(detections, labels):
             # Relative coords are identical in original image (stretched 1:1 → 16:9)
             x1_abs = (xc - w / 2) * ow
             y1_abs = (yc - h / 2) * oh
@@ -231,7 +262,7 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
                 "y_center":      round(yc, 6),
                 "width":         round(w, 6),
                 "height":        round(h, 6),
-                "label":         assign_label((xc, yc, w, h), gt_boxes),
+                "label":         label,
             })
 
             if SAMPLE_MODE and vis is not None:

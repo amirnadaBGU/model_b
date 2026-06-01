@@ -12,11 +12,9 @@ full run (press any key to advance, 'q' to quit the preview early).
 import re
 from pathlib import Path
 
-import torch
 import cv2
 import numpy as np
 import pandas as pd
-from torchvision.ops import nms
 from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -26,13 +24,21 @@ CONF_PARTIAL_FISH = 0.12  # confidence threshold for class 1 (partial_fish)
 SAMPLE_MODE       = False   # process only SAMPLE_SIZE images + show overlay
 SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 
+# Detection pipeline — mirrors Ultralytics' model.val() exactly:
+# inference runs NMS once, per-class, at INFERENCE_CONF / NMS_IOU. The per-class
+# CONF_THRESHOLDS above are applied afterwards (post-NMS), so changing them only
+# selects which surviving detections become crops — it does NOT change the NMS
+# outcome. Keep INFERENCE_CONF low (= val's conf) so NMS sees the full set of
+# candidate boxes before per-class thresholding.
+INFERENCE_CONF    = 0.001  # conf passed to model() — must match val()'s conf
+NMS_IOU           = 0.5    # iou passed to model() — must match val()'s iou (per-class NMS)
+
 # Leave empty to process the full split (or SAMPLE_SIZE images when SAMPLE_MODE=True).
 # Populate with image stems (no extension) to process specific images only, e.g.:
 #   CUSTOM_IMAGES = ["frame_00042", "frame_01337"]
 CUSTOM_IMAGES: list[str] = []
 
-IOU_THRESHOLD     = 0.5
-NMS_IOU_THRESHOLD = 0.5
+IOU_THRESHOLD     = 0.5    # IoU for matching detections to GT in label assignment
 DEBUG_MODE        = False  # print per-detection matching info when True
 
 CLASS_MAP       = {0: "fish", 1: "partial_fish"}
@@ -183,8 +189,10 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
     for img_path in subset:
         stem = img_path.stem
 
+        # Single per-class NMS inside Ultralytics, identical to model.val():
+        # low conf so NMS sees every candidate, iou=NMS_IOU, no class-agnostic merge.
         results  = model(str(img_path), verbose=False,
-                         conf=min(CONF_THRESHOLDS.values()), max_det=1000)
+                         conf=INFERENCE_CONF, iou=NMS_IOU, max_det=1000)
         gt_boxes = load_gt(gt_label_dir / (stem + ".txt"))
 
         orig_path = orig_lookup.get(original_stem(stem))
@@ -197,7 +205,8 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
             continue
         oh, ow = orig.shape[:2]
 
-        # Filter detections by per-class confidence threshold
+        # NMS already happened inside model() (per-class, iou=NMS_IOU). Here we only
+        # keep the surviving detections whose confidence clears the per-class threshold.
         detections: list[tuple] = []
         if results[0].boxes is not None:
             for box in results[0].boxes:
@@ -206,17 +215,6 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
                 if conf >= CONF_THRESHOLDS.get(cls_id, 1.0):
                     xc, yc, w, h = box.xywhn[0].tolist()
                     detections.append((cls_id, conf, xc, yc, w, h))
-
-        # Apply NMS across all detections regardless of class
-        if len(detections) > 1:
-            boxes_abs = torch.tensor([
-                [(xc - w / 2) * 640, (yc - h / 2) * 640,
-                 (xc + w / 2) * 640, (yc + h / 2) * 640]
-                for _, _, xc, yc, w, h in detections
-            ], dtype=torch.float32)
-            scores = torch.tensor([conf for _, conf, *_ in detections], dtype=torch.float32)
-            keep = nms(boxes_abs, scores, NMS_IOU_THRESHOLD)
-            detections = [detections[i] for i in keep.tolist()]
 
         labels = assign_labels_greedy(detections, gt_boxes)
 

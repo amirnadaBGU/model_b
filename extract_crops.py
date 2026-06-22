@@ -2,11 +2,40 @@
 """
 extract_crops.py
 
-Run YOLO inference on the val split of each dataset, extract padded crops
-from the original 16:9 images, apply CLAHE+sharpening, and write labels.csv.
+Run model A (the YOLO detector) on each dataset split, extract padded crops
+from the original 16:9 images, and write labels.csv — the training set for
+model B (the ConvNeXt crop classifier: fish / partial_fish / background).
 
-Set SAMPLE_MODE = True to preview 20 random images with overlay before the
-full run (press any key to advance, 'q' to quit the preview early).
+Labeling philosophy (image-classifier variant)
+-----------------------------------------------
+Model B sees one CROP at inference and answers "what is in this crop?". It does
+NOT know that two overlapping crops belong to the same physical object, and it
+does NOT deduplicate — duplicate suppression is the job of the FINAL NMS that
+runs AFTER model B.
+
+Therefore each detection is labeled INDEPENDENTLY by the class of the GT object
+it overlaps (best IoU >= IOU_THRESHOLD), with NO one-to-one matching:
+  • a crop on a real fish            → its GT class (fish / partial_fish),
+    even if it is a duplicate detection of that same fish.
+  • a crop on nothing (pipe, bg)     → "background".
+
+This is deliberately different from YOLO's official one-to-one eval matching:
+that scheme would force a duplicate crop of a real fish into "background",
+creating near-identical crops with opposite labels — contradictory supervision
+for an image classifier. See assign_labels_by_overlap().
+
+Representing real inference
+---------------------------
+The crops must reflect model A's REAL output. Two requirements:
+  1. Run model A here with the SAME NMS settings as production inference
+     (conf / iou / agnostic). Per the agreed architecture, model A is
+     CLASS-AWARE (AGNOSTIC_NMS = False): a fish box and a partial_fish box on
+     the same object both survive. Keep this identical to deployment.
+  2. Feed only images model A did NOT train on (handled by the input folders
+     you point this script at), or the false-positive rate will be unrealistic.
+
+Set SAMPLE_MODE = True to preview a few images with overlay before the full run
+(press any key to advance, 'q' to quit the preview early).
 """
 
 import re
@@ -18,36 +47,39 @@ import pandas as pd
 from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-PADDING           = 0.1   # expand each box edge by this fraction of box size
-CONF_FISH         = 0.04   # confidence threshold for class 0 (fish)
-CONF_PARTIAL_FISH = 0.12  # confidence threshold for class 1 (partial_fish)
-SAMPLE_MODE       = False   # process only SAMPLE_SIZE images + show overlay
+PADDING           = 0.10   # expand each box edge by this fraction of box size
+CONF_FISH         = 0.06   # confidence threshold for class 0 (fish)
+CONF_PARTIAL_FISH = 0.1    # confidence threshold for class 1 (partial_fish)
+SAMPLE_MODE       = False  # process only a few images + show overlay
 SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 
-# Detection pipeline — mirrors Ultralytics' model.val() exactly:
-# inference runs NMS once, per-class, at INFERENCE_CONF / NMS_IOU. The per-class
-# CONF_THRESHOLDS above are applied afterwards (post-NMS), so changing them only
+# Detection pipeline — must mirror model A's PRODUCTION inference, not val().
+# Inference runs NMS once at INFERENCE_CONF / NMS_IOU / AGNOSTIC_NMS. The per-class
+# CONF_THRESHOLDS above are applied AFTERWARDS (post-NMS), so changing them only
 # selects which surviving detections become crops — it does NOT change the NMS
-# outcome. Keep INFERENCE_CONF low (= val's conf) so NMS sees the full set of
-# candidate boxes before per-class thresholding.
-INFERENCE_CONF    = 0.001  # conf passed to model() — must match val()'s conf
-NMS_IOU           = 0.5    # iou passed to model() — must match val()'s iou (per-class NMS)
+# outcome. Keep INFERENCE_CONF low so NMS sees the full candidate set first.
+INFERENCE_CONF    = 0.001  # conf passed to model() — keep low, threshold later
+NMS_IOU           = 0.5    # iou passed to model() — match deployment
+AGNOSTIC_NMS      = False  # class-AWARE NMS: keep cross-class duplicates (fish +
+                           # partial_fish on the same object both survive). The
+                           # FINAL NMS after model B handles dedup. Must match
+                           # production; flip to True ONLY if deployment uses it.
 
 # Leave empty to process the full split (or SAMPLE_SIZE images when SAMPLE_MODE=True).
 # Populate with image stems (no extension) to process specific images only, e.g.:
 #   CUSTOM_IMAGES = ["frame_00042", "frame_01337"]
 CUSTOM_IMAGES: list[str] = []
 
-IOU_THRESHOLD     = 0.5    # IoU for matching detections to GT in label assignment
+IOU_THRESHOLD     = 0.5    # IoU above which a crop is considered to contain a GT object
 DEBUG_MODE        = False  # print per-detection matching info when True
 
 CLASS_MAP       = {0: "fish", 1: "partial_fish"}
 CONF_THRESHOLDS = {0: CONF_FISH, 1: CONF_PARTIAL_FISH}
 
 DATASETS = [
-    ("data15", "model15.pt"),
-    # ("data15", "model15.pt"),
-    # ("data25", "model25.pt"),
+    #("data12", "model12.pt"),
+    #("data15", "model15.pt"),
+     ("data25", "model25.pt"),
 ]
 SPLIT = "valid"
 # ───────────────────────────────────────────────────────────────────────────────
@@ -96,31 +128,32 @@ def load_gt(label_path: Path) -> list[tuple]:
     return boxes
 
 
-def assign_labels_greedy(
+def assign_labels_by_overlap(
     detections: list[tuple], gt_boxes: list[tuple]
 ) -> list[str]:
-    """Greedy one-to-one matching mirroring YOLO's official evaluation.
+    """Label each detection INDEPENDENTLY by the class of its best-overlapping GT.
 
-    Processes detections highest-confidence first; each GT box is matched
-    at most once. Returns labels in the same order as the input detections.
+    No one-to-one constraint: a GT object may "claim" several detections, so a
+    duplicate crop of a real fish still gets the fish label (as an image, it does
+    contain a fish). Only detections that overlap no GT above IOU_THRESHOLD become
+    "background". This is the correct supervision for an image classifier whose
+    deduplication happens later in the final NMS.
+
+    Returns labels in the same order as the input detections.
     """
-    labels = ["background"] * len(detections)
-    matched_gt: set[int] = set()
-    order = sorted(range(len(detections)), key=lambda i: detections[i][1], reverse=True)
-    for det_idx in order:
-        _, _, xc, yc, w, h = detections[det_idx]
-        best_iou, best_gt_idx = 0.0, -1
-        for gt_idx, (_, gxc, gyc, gw, gh) in enumerate(gt_boxes):
-            if gt_idx in matched_gt:
-                continue
+    labels: list[str] = []
+    for (_, _, xc, yc, w, h) in detections:
+        best_iou, best_cls = 0.0, None
+        for (gcls, gxc, gyc, gw, gh) in gt_boxes:
             score = iou_xywhn((xc, yc, w, h), (gxc, gyc, gw, gh))
             if score > best_iou:
-                best_iou, best_gt_idx = score, gt_idx
-        if best_iou >= IOU_THRESHOLD and best_gt_idx != -1:
-            gcls = gt_boxes[best_gt_idx][0]
-            labels[det_idx] = CLASS_MAP.get(gcls, str(gcls))
-            matched_gt.add(best_gt_idx)
+                best_iou, best_cls = score, gcls
+        if best_iou >= IOU_THRESHOLD and best_cls is not None:
+            labels.append(CLASS_MAP.get(best_cls, str(best_cls)))
+        else:
+            labels.append("background")
     return labels
+
 
 def expand_box(
     x1: float, y1: float, x2: float, y2: float,
@@ -175,7 +208,6 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
             print(f"  Warning: images not found in {processed_img_dir}: {missing}")
     elif SAMPLE_MODE:
         subset = images[:SAMPLE_SIZE]
-        subset = images[44:49]
     else:
         subset = images
     print(f"  Processing {len(subset)} image(s) …")
@@ -189,10 +221,11 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
     for img_path in subset:
         stem = img_path.stem
 
-        # Single per-class NMS inside Ultralytics, identical to model.val():
-        # low conf so NMS sees every candidate, iou=NMS_IOU, no class-agnostic merge.
+        # NMS runs once inside Ultralytics with the deployment settings.
+        # AGNOSTIC_NMS=False → class-aware: cross-class duplicates survive.
         results  = model(str(img_path), verbose=False,
-                         conf=INFERENCE_CONF, iou=NMS_IOU, max_det=1000)
+                         conf=INFERENCE_CONF, iou=NMS_IOU,
+                         agnostic_nms=AGNOSTIC_NMS, max_det=1000)
         gt_boxes = load_gt(gt_label_dir / (stem + ".txt"))
 
         orig_path = orig_lookup.get(original_stem(stem))
@@ -205,8 +238,8 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
             continue
         oh, ow = orig.shape[:2]
 
-        # NMS already happened inside model() (per-class, iou=NMS_IOU). Here we only
-        # keep the surviving detections whose confidence clears the per-class threshold.
+        # NMS already happened inside model(). Keep only survivors whose confidence
+        # clears the per-class threshold.
         detections: list[tuple] = []
         if results[0].boxes is not None:
             for box in results[0].boxes:
@@ -216,7 +249,7 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
                     xc, yc, w, h = box.xywhn[0].tolist()
                     detections.append((cls_id, conf, xc, yc, w, h))
 
-        labels = assign_labels_greedy(detections, gt_boxes)
+        labels = assign_labels_by_overlap(detections, gt_boxes)
 
         if DEBUG_MODE:
             print(f"\n  [DEBUG] {img_path.name}")
@@ -227,7 +260,7 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
                      for _, gxc, gyc, gw, gh in gt_boxes),
                     default=0.0,
                 )
-                print(f"    det[{i}] conf={conf:.4f} class={CLASS_MAP.get(cls_id, str(cls_id))} "
+                print(f"    det[{i}] conf={conf:.4f} pred={CLASS_MAP.get(cls_id, str(cls_id))} "
                       f"label={labels[i]} best_iou={best_iou:.4f}")
 
         vis = orig.copy() if SAMPLE_MODE else None
@@ -250,25 +283,33 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
             crop_fname = f"{stem}_crop{idx:03d}.jpg"
             cv2.imwrite(str(out_dir / crop_fname), crop)
 
+            # Tabular features for model B variant B (image + metadata) and model C.
+            box_area     = w * h                              # normalized area
+            long_side    = max(w, h)
+            short_side   = min(w, h)
+            aspect_ratio = (long_side / short_side) if short_side > 0 else 0.0  # always >= 1
+
             rows.append({
                 "image_name":    img_path.name,
                 "crop_filename": crop_fname,
-                "class_id":      cls_id,
+                "class_id":      cls_id,                       # model A's predicted class
                 "class_name":    CLASS_MAP.get(cls_id, str(cls_id)),
                 "confidence":    round(conf, 4),
                 "x_center":      round(xc, 6),
                 "y_center":      round(yc, 6),
                 "width":         round(w, 6),
                 "height":        round(h, 6),
-                "label":         label,
+                "box_area":      round(box_area, 6),
+                "aspect_ratio":  round(aspect_ratio, 4),
+                "label":         label,                        # GT-based target for model B
             })
 
             if SAMPLE_MODE and vis is not None:
                 color = (0, 220, 0) if cls_id == 0 else (0, 140, 255)
                 cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), color, 5)
-                tag = f"{CLASS_MAP.get(cls_id, str(cls_id))} {conf:.2f}"
+                tag = f"{CLASS_MAP.get(cls_id, str(cls_id))} {conf:.2f} -> {label}"
                 cv2.putText(vis, tag, (x1p, max(y1p - 12, 30)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 4)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
 
             idx += 1
         crop_counter[stem] = idx
@@ -295,7 +336,9 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
         else:
             combined = new_df
         combined.to_csv(csv_path, index=False)
-        print(f"  {len(rows)} crop(s) saved → {out_dir}")
+        n_bg = sum(1 for r in rows if r["label"] == "background")
+        print(f"  {len(rows)} crop(s) saved → {out_dir}   "
+              f"({len(rows) - n_bg} object / {n_bg} background)")
         print(f"  CSV → {csv_path}")
     else:
         print("  No detections above threshold.")

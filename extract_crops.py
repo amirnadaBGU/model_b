@@ -48,8 +48,8 @@ from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 PADDING           = 0.10   # expand each box edge by this fraction of box size
-CONF_FISH         = 0.06   # confidence threshold for class 0 (fish)
-CONF_PARTIAL_FISH = 0.1    # confidence threshold for class 1 (partial_fish)
+CONF_FISH         = 0.02   # confidence threshold for class 0 (fish)
+CONF_PARTIAL_FISH = 0.07    # confidence threshold for class 1 (partial_fish)
 SAMPLE_MODE       = False  # process only a few images + show overlay
 SAMPLE_SIZE       = 5      # first N images from the sorted dataset
 
@@ -77,9 +77,10 @@ CLASS_MAP       = {0: "fish", 1: "partial_fish"}
 CONF_THRESHOLDS = {0: CONF_FISH, 1: CONF_PARTIAL_FISH}
 
 DATASETS = [
+    ("data", "model.pt"),
     #("data12", "model12.pt"),
     #("data15", "model15.pt"),
-     ("data25", "model25.pt"),
+    #("data25", "model25.pt"),
 ]
 SPLIT = "valid"
 # ───────────────────────────────────────────────────────────────────────────────

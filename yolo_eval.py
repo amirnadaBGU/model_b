@@ -25,8 +25,8 @@ MATCH_IOU_THRESHOLD = 0.5  # סף חפיפה להכרזה על זיהוי מוצ
 NMS_IOU_THRESHOLD = 0.7  # סף NMS בתוך המודל, מונע מחיקת דגים צמודים
 
 # Flags
-PER_CLASS_LOCK = True
-AGNOSTIC_NMS = False
+PER_CLASS_LOCK = False
+AGNOSTIC_NMS = True
 
 # ===================================================================================
 # 3. Load model

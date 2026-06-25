@@ -19,7 +19,7 @@ import pandas as pd
 # ── Configuration ──────────────────────────────────────────────────────────────
 CROPS_BASE    = Path("crops")
 EXPORT_DIR    = Path("roboflow_export")
-DATASETS      = ["data12", "data15", "data25"]
+DATASETS      = ["data","data12", "data15", "data25"]
 SPLITS        = ["valid"]          # add "train" etc. if needed
 ONLY_APPROVED = False               # if True, skip rows where review_status != "approved"
 # ───────────────────────────────────────────────────────────────────────────────

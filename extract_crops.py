@@ -64,14 +64,17 @@ AGNOSTIC_NMS      = False  # class-AWARE NMS: keep cross-class duplicates (fish 
                            # partial_fish on the same object both survive). The
                            # FINAL NMS after model B handles dedup. Must match
                            # production; flip to True ONLY if deployment uses it.
+HALF_PRECISION    = False  # must match HALF_PRECISION in yolo_confidence_sweep.py
 
 # Leave empty to process the full split (or SAMPLE_SIZE images when SAMPLE_MODE=True).
 # Populate with image stems (no extension) to process specific images only, e.g.:
 #   CUSTOM_IMAGES = ["frame_00042", "frame_01337"]
 CUSTOM_IMAGES: list[str] = []
 
-IOU_THRESHOLD     = 0.5    # IoU above which a crop is considered to contain a GT object
+IOU_THRESHOLD     = 0.1    # IoU above which a crop is considered to contain a GT object
 DEBUG_MODE        = False  # print per-detection matching info when True
+
+FILTER = True
 
 CLASS_MAP       = {0: "fish", 1: "partial_fish"}
 CONF_THRESHOLDS = {0: CONF_FISH, 1: CONF_PARTIAL_FISH}
@@ -86,16 +89,16 @@ SPLIT = "valid"
 # ───────────────────────────────────────────────────────────────────────────────
 
 
-# def apply_filters(image: np.ndarray) -> np.ndarray:
-#     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-#     l, a, b = cv2.split(lab)
-#     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-#     cl = clahe.apply(l)
-#     limg = cv2.merge((cl, a, b))
-#     clahed = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-#     clahed_then_blurred = cv2.GaussianBlur(clahed, (55, 55), 0)
-#     sharpened = cv2.addWeighted(clahed, 1.8, clahed_then_blurred, -0.8, 0)
-#     return sharpened
+def apply_filters(image: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    clahed = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    clahed_then_blurred = cv2.GaussianBlur(clahed, (55, 55), 0)
+    sharpened = cv2.addWeighted(clahed, 1.8, clahed_then_blurred, -0.8, 0)
+    return sharpened
 
 def apply_filters(image: np.ndarray) -> np.ndarray:
     return image
@@ -129,30 +132,50 @@ def load_gt(label_path: Path) -> list[tuple]:
     return boxes
 
 
-def assign_labels_by_overlap(
-    detections: list[tuple], gt_boxes: list[tuple]
-) -> list[str]:
-    """Label each detection INDEPENDENTLY by the class of its best-overlapping GT.
+def assign_labels_by_overlap(detections: list[tuple], gt_boxes: list[tuple]) -> list[str]:
+    """Assigns labels based on strict class-specific IoU brackets.
 
-    No one-to-one constraint: a GT object may "claim" several detections, so a
-    duplicate crop of a real fish still gets the fish label (as an image, it does
-    contain a fish). Only detections that overlap no GT above IOU_THRESHOLD become
-    "background". This is the correct supervision for an image classifier whose
-    deduplication happens later in the final NMS.
+    GT is Fish (0):
+      • 0.0 <= IoU < 0.10  → background
+      • 0.10 <= IoU < 0.50  → partial_fish
+      • 0.50 <= IoU <= 1.0  → fish
 
-    Returns labels in the same order as the input detections.
+    GT is Partial Fish (1):
+      • 0.0 <= IoU < 0.5  → background
+      • 0.50 <= IoU <= 1.0  → partial_fish
     """
     labels: list[str] = []
+
     for (_, _, xc, yc, w, h) in detections:
-        best_iou, best_cls = 0.0, None
+        best_iou = 0.0
+        best_cls = None
+
+        # 1. מציאת קופסת האמת (GT) עם החפיפה הגבוהה ביותר
         for (gcls, gxc, gyc, gw, gh) in gt_boxes:
             score = iou_xywhn((xc, yc, w, h), (gxc, gyc, gw, gh))
             if score > best_iou:
-                best_iou, best_cls = score, gcls
-        if best_iou >= IOU_THRESHOLD and best_cls is not None:
-            labels.append(CLASS_MAP.get(best_cls, str(best_cls)))
+                best_iou = score
+                best_cls = gcls
+
+        # 2. סיווג לקטגוריות לפי מטריצת החוקים שהגדרת
+        if best_cls == 0:  # ה-GT המקורי הוא דג שלם (fish)
+            if best_iou < 0.10:
+                labels.append("background")
+            elif best_iou < 0.5:
+                labels.append("partial_fish")
+            else:
+                labels.append("fish")
+
+        elif best_cls == 1:  # ה-GT המקורי הוא דג חלקי (partial_fish)
+            if best_iou < 0.5:
+                labels.append("background")
+            else:
+                labels.append("partial_fish")
+
         else:
+            # מקרה קצה: אין אף קופסת GT בתמונה (תמונת רקע מוחלטת)
             labels.append("background")
+
     return labels
 
 
@@ -224,9 +247,10 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
 
         # NMS runs once inside Ultralytics with the deployment settings.
         # AGNOSTIC_NMS=False → class-aware: cross-class duplicates survive.
-        results  = model(str(img_path), verbose=False,
-                         conf=INFERENCE_CONF, iou=NMS_IOU,
-                         agnostic_nms=AGNOSTIC_NMS, max_det=1000)
+        results = model(str(img_path), verbose=False,
+                        conf=INFERENCE_CONF, iou=NMS_IOU,
+                        agnostic_nms=AGNOSTIC_NMS, max_det=1000,
+                        half=HALF_PRECISION)
         gt_boxes = load_gt(gt_label_dir / (stem + ".txt"))
 
         orig_path = orig_lookup.get(original_stem(stem))
@@ -237,6 +261,11 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
         if orig is None:
             print(f"  Could not read {orig_path}, skipping.")
             continue
+
+        # ─── השינוי המרכזי כאן: החלת הפילטר על כל התמונה המקורית לפני החיתוך ───
+        orig = apply_filters(orig)
+        # ──────────────────────────────────────────────────────────────────────
+
         oh, ow = orig.shape[:2]
 
         # NMS already happened inside model(). Keep only survivors whose confidence
@@ -245,7 +274,7 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
         if results[0].boxes is not None:
             for box in results[0].boxes:
                 cls_id = int(box.cls[0])
-                conf   = float(box.conf[0])
+                conf = float(box.conf[0])
                 if conf >= CONF_THRESHOLDS.get(cls_id, 1.0):
                     xc, yc, w, h = box.xywhn[0].tolist()
                     detections.append((cls_id, conf, xc, yc, w, h))
@@ -276,11 +305,13 @@ def process_dataset(dataset_name: str, model_path: Path, base_dir: Path) -> None
 
             x1p, y1p, x2p, y2p = expand_box(x1_abs, y1_abs, x2_abs, y2_abs, ow, oh, PADDING)
 
+            # כעת החיתוך מתבצע מתוך התמונה orig שכבר עברה פילטרציה מלאה
             crop = orig[y1p:y2p, x1p:x2p]
             if crop.size == 0:
                 continue
 
-            crop = apply_filters(crop)
+            # השורה הישנה crop = apply_filters(crop) נמחקה מכאן!
+
             crop_fname = f"{stem}_crop{idx:03d}.jpg"
             cv2.imwrite(str(out_dir / crop_fname), crop)
 

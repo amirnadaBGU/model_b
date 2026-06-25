@@ -1,13 +1,21 @@
 import yaml
 from ultralytics import YOLO
+from ultralytics.data.augment import LetterBox
 import os
+import glob
 import numpy as np
 import cv2
 
 IOU_THRESHOLD = 0.5
-CONF = 0.215
+CONF = 0.25
 GRAPHICAL_DEBUG = False
 MODE = 'CLASSIC' #'ADVANCED'
+
+# כשTrue: ה-PREDICT עובר את אותו preprocess כמו model.val() — letterbox מלבני ל-672
+# (תוכן 640 native + מסגרת אפורה, בלי הגדלה). כשFalse: predict רגיל ב-640.
+USE_VAL_PREPROCESS = True
+VAL_IMGSZ = 672
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 def calculate_iou(box1, box2):
@@ -39,74 +47,77 @@ def calculate_iou(box1, box2):
 
 def evaluate_class_specific(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=IOU_THRESHOLD):
     """
-    מחשבת TP, FP, FN לכל מחלקה בנפרד ומחזירה גם מילון סטטוסים לציור גראפי
+    שכפול נאמן של לוגיקת השיוך של Ultralytics (validator.match_predictions) — המנוע
+    שמאחורי ה-Precision/Recall/F1 שמודפסים ב-model.val().
+
+    ההבדל מ-evaluate_class_specific_confidence:
+      • השיוך נעשה לפי IoU (מהגבוה לנמוך) ולא לפי Confidence.
+      • מסתכלים על כל זוגות (GT, חיזוי) ביחד באופן גלובלי, לא חיזוי-אחרי-חיזוי.
+    זהו שיוך מודע-מחלקה: זוגות שבהם מחלקת החיזוי ≠ מחלקת ה-GT מאופסים מראש, כך
+    שחיזוי יכול להתאים רק ל-GT מאותה מחלקה.
+    מחזירה image_metrics (TP/FP/FN לכל מחלקה) ו-pred_statuses ('tp'/'fp' לכל חיזוי).
     """
     image_metrics = {
         0: {"tp": 0, "fp": 0, "fn": 0},
         1: {"tp": 0, "fp": 0, "fn": 0}
     }
 
-    # רשימה בגודל של pred_boxes שתחזיק 'tp' או 'fp' עבור כל ניבוי
-    pred_statuses = ['fp'] * len(pred_boxes)
+    n_pred = len(pred_boxes)
+    n_gt = len(gt_boxes)
+    pred_statuses = ['fp'] * n_pred
 
-    if len(pred_boxes) == 0:
+    # מקרי קצה
+    if n_pred == 0:
         for g_cls in gt_classes:
             image_metrics[int(g_cls)]["fn"] += 1
         return image_metrics, pred_statuses
 
-    if len(gt_boxes) == 0:
+    if n_gt == 0:
         for p_cls in pred_classes:
             image_metrics[int(p_cls)]["fp"] += 1
         return image_metrics, pred_statuses
 
-    for target_cls in [0, 1]:
-        # indices of racing bounding boxes for the current class p - predict, g - ground truth
-        p_indices = [i for i, c in enumerate(pred_classes) if int(c) == target_cls]
-        g_indices = [j for j, c in enumerate(gt_classes) if int(c) == target_cls]
+    # 1. מטריצת IoU בין כל GT (שורות) לכל חיזוי (עמודות) — המקבילה ל-box_iou ב-Ultralytics
+    iou = np.zeros((n_gt, n_pred))
+    for g in range(n_gt):
+        for p in range(n_pred):
+            iou[g, p] = calculate_iou(pred_boxes[p], gt_boxes[g])
 
-        # coordinate of rcaing bounding boxes for the current class
-        sub_preds = pred_boxes[p_indices] if len(p_indices) > 0 else []
-        sub_gts = gt_boxes[g_indices] if len(g_indices) > 0 else []
+    # 2. איפוס זוגות ממחלקות שונות => שיוך מודע-מחלקה (iou = iou * correct_class)
+    correct_class = (np.asarray(gt_classes).astype(int)[:, None] ==
+                     np.asarray(pred_classes).astype(int)[None, :])
+    iou = iou * correct_class
 
-        gt_matched = [False] * len(sub_gts)
+    matched_gt = set()
+    matched_pred = set()
 
-        for sub_p_idx, p_box in enumerate(sub_preds):
-            # מוצאים את האינדקס המקורי במערך הכללי של pred_boxes
-            orig_p_idx = p_indices[sub_p_idx]
+    # 3. כל הזוגות שעוברים את סף ה-IoU, ממוינים מהגבוה לנמוך, ואז ייחוד לפי חיזוי ואז לפי GT
+    #    (בדיוק כמו match_predictions: argsort על ה-IoU, ואז np.unique על עמודת החיזוי ואז על עמודת ה-GT)
+    cand = np.argwhere(iou >= iou_threshold)  # שורות בפורמט [gt_idx, pred_idx]
+    if len(cand) > 0:
+        order = iou[cand[:, 0], cand[:, 1]].argsort()[::-1]
+        cand = cand[order]
+        cand = cand[np.unique(cand[:, 1], return_index=True)[1]]  # חיזוי יחיד לכל חיזוי
+        cand = cand[np.unique(cand[:, 0], return_index=True)[1]]  # GT יחיד לכל GT
 
-            best_iou = -1
-            best_gt_idx = -1
+        for g_idx, p_idx in cand:
+            g_idx, p_idx = int(g_idx), int(p_idx)
+            matched_gt.add(g_idx)
+            matched_pred.add(p_idx)
+            cls = int(pred_classes[p_idx])  # == מחלקת ה-GT, כי השיוך מודע-מחלקה
+            image_metrics[cls]["tp"] += 1
+            pred_statuses[p_idx] = 'tp'
 
-            for j, g_box in enumerate(sub_gts):
-                iou = calculate_iou(p_box, g_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = j
-            if MODE =='CLASSIC':
-                if best_iou >= iou_threshold and not gt_matched[best_gt_idx]:
-                    image_metrics[target_cls]["tp"] += 1
-                    gt_matched[best_gt_idx] = True
-                    pred_statuses[orig_p_idx] = 'tp'  # מסמנים כהצלחה לטובת הציור
-                else:
-                    image_metrics[target_cls]["fp"] += 1
-                    pred_statuses[orig_p_idx] = 'fp'  # מסמנים כטעות/כפילות לטובת הציור
-            elif MODE =='ADVANCED':
-                if best_iou >= iou_threshold and not gt_matched[best_gt_idx]:
-                    image_metrics[target_cls]["tp"] += 1
-                    gt_matched[best_gt_idx] = True
-                    pred_statuses[orig_p_idx] = 'tp'
-                elif best_iou >= iou_threshold and gt_matched[best_gt_idx]:
-                    # 2. חפיפה טובה אבל הדג כבר תפוס -> לא עושים כלום!
-                    # התיבה לא מקבלת TP אבל גם לא נענשת ב-FP.
-                    # לטובת הציור הגראפי, נסמן אותה למשל כ-'duplicate' או 'tp' כדי שלא תהיה אדומה
-                    pred_statuses[orig_p_idx] = 'tp'
-                else:
-                    # 3. best_iou < iou_threshold -> חפיפה נמוכה או אין GT בכלל -> FP
-                    image_metrics[target_cls]["fp"] += 1
-                    pred_statuses[orig_p_idx] = 'fp'
+    # 4. חיזויים שלא שויכו => FP (לפי מחלקת החיזוי)
+    for p in range(n_pred):
+        if p not in matched_pred:
+            image_metrics[int(pred_classes[p])]["fp"] += 1
+            pred_statuses[p] = 'fp'
 
-
-        image_metrics[target_cls]["fn"] = len(sub_gts) - sum(gt_matched)
+    # 5. GT שלא שויכו => FN (לפי מחלקת ה-GT)
+    for g in range(n_gt):
+        if g not in matched_gt:
+            image_metrics[int(gt_classes[g])]["fn"] += 1
 
     return image_metrics, pred_statuses
 
@@ -177,6 +188,81 @@ def evaluate_class_specific_(pred_boxes, pred_classes, gt_boxes, gt_classes, iou
 
     return image_metrics, pred_statuses
 
+def evaluate_class_specific_confidence(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=IOU_THRESHOLD):
+    """
+    מחשבת TP, FP, FN לכל מחלקה בנפרד ומחזירה גם מילון סטטוסים לציור גראפי.
+    שיוך לפי סדר Confidence: החיזויים מגיעים ממוינים מהגבוה לנמוך, וכל חיזוי בתורו
+    תופס את ה-GT הפנוי מאותה מחלקה בעל ה-IoU הכי גבוה.
+    """
+    image_metrics = {
+        0: {"tp": 0, "fp": 0, "fn": 0},
+        1: {"tp": 0, "fp": 0, "fn": 0}
+    }
+
+    # רשימה בגודל של pred_boxes שתחזיק 'tp' או 'fp' עבור כל ניבוי
+    pred_statuses = ['fp'] * len(pred_boxes)
+
+    if len(pred_boxes) == 0:
+        for g_cls in gt_classes:
+            image_metrics[int(g_cls)]["fn"] += 1
+        return image_metrics, pred_statuses
+
+    if len(gt_boxes) == 0:
+        for p_cls in pred_classes:
+            image_metrics[int(p_cls)]["fp"] += 1
+        return image_metrics, pred_statuses
+
+    for target_cls in [0, 1]:
+        # indices of racing bounding boxes for the current class p - predict, g - ground truth
+        p_indices = [i for i, c in enumerate(pred_classes) if int(c) == target_cls]
+        g_indices = [j for j, c in enumerate(gt_classes) if int(c) == target_cls]
+
+        # coordinate of rcaing bounding boxes for the current class
+        sub_preds = pred_boxes[p_indices] if len(p_indices) > 0 else []
+        sub_gts = gt_boxes[g_indices] if len(g_indices) > 0 else []
+
+        gt_matched = [False] * len(sub_gts)
+
+        for sub_p_idx, p_box in enumerate(sub_preds):
+            # מוצאים את האינדקס המקורי במערך הכללי של pred_boxes
+            orig_p_idx = p_indices[sub_p_idx]
+
+            best_iou = -1
+            best_gt_idx = -1
+
+            for j, g_box in enumerate(sub_gts):
+                iou = calculate_iou(p_box, g_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = j
+            if MODE =='CLASSIC':
+                if best_iou >= iou_threshold and not gt_matched[best_gt_idx]:
+                    image_metrics[target_cls]["tp"] += 1
+                    gt_matched[best_gt_idx] = True
+                    pred_statuses[orig_p_idx] = 'tp'  # מסמנים כהצלחה לטובת הציור
+                else:
+                    image_metrics[target_cls]["fp"] += 1
+                    pred_statuses[orig_p_idx] = 'fp'  # מסמנים כטעות/כפילות לטובת הציור
+            elif MODE =='ADVANCED':
+                if best_iou >= iou_threshold and not gt_matched[best_gt_idx]:
+                    image_metrics[target_cls]["tp"] += 1
+                    gt_matched[best_gt_idx] = True
+                    pred_statuses[orig_p_idx] = 'tp'
+                elif best_iou >= iou_threshold and gt_matched[best_gt_idx]:
+                    # 2. חפיפה טובה אבל הדג כבר תפוס -> לא עושים כלום!
+                    # התיבה לא מקבלת TP אבל גם לא נענשת ב-FP.
+                    # לטובת הציור הגראפי, נסמן אותה למשל כ-'duplicate' או 'tp' כדי שלא תהיה אדומה
+                    pred_statuses[orig_p_idx] = 'tp'
+                else:
+                    # 3. best_iou < iou_threshold -> חפיפה נמוכה או אין GT בכלל -> FP
+                    image_metrics[target_cls]["fp"] += 1
+                    pred_statuses[orig_p_idx] = 'fp'
+
+
+        image_metrics[target_cls]["fn"] = len(sub_gts) - sum(gt_matched)
+
+    return image_metrics, pred_statuses
+
 if __name__ == "__main__":
     current_project_dir = os.path.dirname(os.path.abspath(__file__))
     runs_output_dir = os.path.join(current_project_dir, "runs")
@@ -185,16 +271,42 @@ if __name__ == "__main__":
 
     model = YOLO("version6.pt", task="detect")
 
-    results = model.predict(val_images_dir,
+    image_files = sorted(glob.glob(os.path.join(val_images_dir, "*.*")))
+
+    if USE_VAL_PREPROCESS:
+        # שכפול ה-preprocess של model.val(): letterbox מלבני ל-VAL_IMGSZ עם מסגרת אפורה,
+        # בלי להגדיל את התוכן (scaleup=False). שומרים לכל תמונה את (ratio, dw, dh, w0, h0)
+        # כדי להחזיר אחר כך את הקופסאות לקואורדינטות המקוריות.
+        lb = LetterBox((VAL_IMGSZ, VAL_IMGSZ), auto=False, scaleup=False)
+        lb_imgs, lb_params = [], []
+        a=0
+        for f in image_files:
+            a+=1
+            print(a)
+            im = cv2.imread(f)
+            h0, w0 = im.shape[:2]
+            ratio = min(VAL_IMGSZ / w0, VAL_IMGSZ / h0, 1.0)
+            nw, nh = round(w0 * ratio), round(h0 * ratio)
+            dw, dh = (VAL_IMGSZ - nw) / 2, (VAL_IMGSZ - nh) / 2
+            lb_imgs.append(lb(image=im))
+            lb_params.append((ratio, dw, dh, w0, h0))
+        predict_input = lb_imgs
+        predict_imgsz = VAL_IMGSZ
+    else:
+        lb_params = [(1.0, 0.0, 0.0, None, None)] * len(image_files)
+        predict_input = val_images_dir
+        predict_imgsz = 640
+
+    results = model.predict(predict_input,
                             agnostic_nms=False,
                             conf=CONF,
                             iou=0.45,
-                            imgsz=640,
+                            imgsz=predict_imgsz,
                             save=True,
                             save_txt=True,
                             save_conf=True,
                             project=runs_output_dir)
-
+    print("finish predict")
     global_metrics = {
         0: {"tp": 0, "fp": 0, "fn": 0},
         1: {"tp": 0, "fp": 0, "fn": 0}
@@ -202,9 +314,14 @@ if __name__ == "__main__":
 
     class_names = {0: "Fish", 1: "Partial"}
     k=0
-    for res in results:
-        k+=1
-        img_path = res.path
+    for k, res in enumerate(results):
+        ratio, dw, dh, w0, h0 = lb_params[k]
+
+        if USE_VAL_PREPROCESS:
+            # התמונות נשלחו כ-arrays, לכן לוקחים את השם מרשימת הקבצים ולא מ-res.path
+            img_path = image_files[k]
+        else:
+            img_path = res.path
         img_name = os.path.splitext(os.path.basename(img_path))[0]
         gt_label_path = os.path.join(val_labels_dir, f"{img_name}.txt")
 
@@ -217,7 +334,15 @@ if __name__ == "__main__":
         raw_boxes = res.boxes.xyxy.cpu().numpy()
         raw_classes = res.boxes.cls.cpu().numpy()
         raw_confs = res.boxes.conf.cpu().numpy()
-        orig_h, orig_w = res.orig_shape
+
+        if USE_VAL_PREPROCESS:
+            # מחזירים את הקופסאות מקואורדינטות ה-letterbox (672) לקואורדינטות המקוריות
+            raw_boxes = raw_boxes.copy()
+            raw_boxes[:, [0, 2]] = (raw_boxes[:, [0, 2]] - dw) / ratio
+            raw_boxes[:, [1, 3]] = (raw_boxes[:, [1, 3]] - dh) / ratio
+            orig_w, orig_h = w0, h0  # הגודל המקורי האמיתי, כדי שה-GT ייושב באותו מרחב
+        else:
+            orig_h, orig_w = res.orig_shape
 
         sort_indices = np.argsort(raw_confs)[::-1]
 
@@ -421,7 +546,7 @@ if __name__ == "__main__":
     model.val(data=DATA_YAML,
               agnostic_nms=False,
               split="val",
-              conf=CONF,
+              conf=0.001,
               iou=0.5,
               imgsz=640,
               max_det=1000,

@@ -10,7 +10,7 @@ ANALYZE_VAL = False
 ANALYZE_PREDICT = True
 
 IOU_THRESHOLD = 0.5 # what counts as match
-CONF = 0.1 # model confidence score
+CONF = 0.25 # model confidence score
 GRAPHICAL_DEBUG = False # graphical debug
 MODE = 'CLASSIC' #'ADVANCED' # maybe not relevant
 
@@ -24,7 +24,7 @@ VAL_IMGSZ = 672
 # and keeps only the one with the highest confidence for each object. Crucial for counting
 # (to avoid double-counting the same fish), as the model is end-to-end and does not perform NMS on its own.
 # When False: the output remains AS IS.
-USE_NMS = True
+USE_NMS = False
 NMS_IOU = 0.5  # The IoU threshold above which a box is considered a duplicate and removed
 
 # Bypass OpenMP multiple initialization error (prevents crash due to duplicate libraries)
@@ -32,29 +32,31 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 def calculate_iou(box1, box2):
     """
-    מחשבת IoU בין שתי קופסאות בפורמט [x_min, y_min, x_max, y_max]
+    Calculates the IoU (Intersection over Union) between two bounding boxes
+    in [x_min, y_min, x_max, y_max] format.
     """
-    # 1. קביעת קואורדינטות של מלבן החיתוך (החלק המשותף)
-    x_left = max(box1[0], box2[0])
-    y_top = max(box1[1], box2[1])
-    x_right = min(box1[2], box2[2])
-    y_bottom = min(box1[3], box2[3])
 
-    # אם אין חפיפה בכלל
+    # 1. Determine the coordinates of the intersection rectangle
+    x_left = max(box1[0], box2[0]) # most right
+    y_top = max(box1[1], box2[1]) # most bottom
+    x_right = min(box1[2], box2[2]) # most left
+    y_bottom = min(box1[3], box2[3]) # most top
+
+    # no intersection at all
     if x_right < x_left or y_bottom < y_top:
         return 0.0
 
-    # 2. חישוב שטח החיתוך
+    # 2. Calculate the area of intersection rectangle
     intersection_area = (x_right - x_left) * (y_bottom - y_top)
 
-    # 3. חישוב השטחים של כל אחת מהקופסאות בנפרד
+    # 3. Calculate individual box areas
     box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
     box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
 
-    # 4. חישוב שטח האיחוד
+    # 4. Calculate the area of the union
     union_area = box1_area + box2_area - intersection_area
 
-    # החזרת היחס
+    # Return the ratio (IoU)
     return intersection_area / union_area
 
 def class_agnostic_nms(boxes, confs, iou_thr=NMS_IOU):
@@ -276,6 +278,11 @@ if __name__ == "__main__":
             1: {"tp": 0, "fp": 0, "fn": 0}
         }
 
+        # מוני ספירה (MAE) בסף ה-CONF הנוכחי
+        count_n_images = 0
+        count_abs = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |נספרו - GT| לתמונה
+        count_gt = {0: 0, 1: 0}                        # סכום GT לכל מחלקה (לחישוב ממוצע לתמונה)
+
         class_names = {0: "Fish", 1: "Partial"}
         for res in results:
             img_name = os.path.splitext(os.path.basename(res.path))[0]
@@ -351,6 +358,15 @@ if __name__ == "__main__":
                 global_metrics[c]["tp"] += img_results[c]["tp"]
                 global_metrics[c]["fp"] += img_results[c]["fp"]
                 global_metrics[c]["fn"] += img_results[c]["fn"]
+
+            # ספירה: צבירת שגיאת |נספרו - GT| לתמונה (כולל ולכל מחלקה בנפרד)
+            count_n_images += 1
+            pf = int((pred_classes == 0).sum()); pp = int((pred_classes == 1).sum())
+            gf = int((gt_classes == 0).sum()); gp = int((gt_classes == 1).sum())
+            count_abs[0] += abs(pf - gf)
+            count_abs[1] += abs(pp - gp)
+            count_abs["total"] += abs((pf + pp) - (gf + gp))
+            count_gt[0] += gf; count_gt[1] += gp
 
             # ===================================================================
             # 🎨 חלק גראפי חסין קצוות: מניעת התנגשויות + הגבלת גבולות תמונה מוחלטת
@@ -507,6 +523,22 @@ if __name__ == "__main__":
             print("-" * 45)
 
         print("=" * 60)
+
+        # ===================================================================
+        # 🔢 דוח ספירה (MAE) בסף ה-CONF הנוכחי
+        # ===================================================================
+        if count_n_images > 0:
+            n = count_n_images
+            print(f"\n 🔢 דוח ספירה (conf={CONF}, NMS={'ON' if USE_NMS else 'OFF'})")
+            print("-" * 45)
+            print(f"   דגים שלמים  (fish)    בממוצע לתמונה (GT): {count_gt[0] / n:.2f}")
+            print(f"   דגים חלקיים (partial) בממוצע לתמונה (GT): {count_gt[1] / n:.2f}")
+            print(f"   סך הכל אובייקטים        בממוצע לתמונה (GT): {(count_gt[0] + count_gt[1]) / n:.2f}")
+            print(f"   ----------------------------------")
+            print(f"   📏 MAE ממוצע כולל לתמונה:        {count_abs['total'] / n:.3f}")
+            print(f"   📏 MAE ממוצע לדגים שלמים:        {count_abs[0] / n:.3f}")
+            print(f"   📏 MAE ממוצע לדגים חלקיים:       {count_abs[1] / n:.3f}")
+            print("=" * 60)
 
 # Val
     if ANALYZE_VAL:

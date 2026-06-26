@@ -5,10 +5,14 @@ import os
 import glob
 import numpy as np
 import cv2
+import re
 
+# ___What to do___:
 ANALYZE_VAL = False
 ANALYZE_PREDICT = True
+ANALYSE_2_STEP = False
 
+# ___Global variables___:
 IOU_THRESHOLD = 0.5 # what counts as match
 CONF = 0.25 # model confidence score
 GRAPHICAL_DEBUG = False # graphical debug
@@ -27,55 +31,82 @@ VAL_IMGSZ = 672
 USE_NMS = False
 NMS_IOU = 0.5  # The IoU threshold above which a box is considered a duplicate and removed
 
+# Two-step pipeline: YOLO -> NMS(per flag) -> crop each detection from the ORIGINAL image
+# -> ConvNeXt classifier (best_ckpt.ckpt) reassigns class {background->drop, fish, partial}
+# -> evaluate. Lets stage-2 fix YOLO's class confusion and reject false positives.
+
+# Classifier params:
+CKPT_PATH = "best_ckpt.ckpt"                              # ConvNeXt (Lightning ckpt; loaded without pl)
+ORIG_IMAGES_DIR = "datasets/data_original/valid/images"  # full-res originals, for the crops
+CROP_PADDING = 0.10                                       # expand each box by 10% before cropping
+
 # Bypass OpenMP multiple initialization error (prevents crash due to duplicate libraries)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-def calculate_iou(box1, box2):
-    """
-    Calculates the IoU (Intersection over Union) between two bounding boxes
-    in [x_min, y_min, x_max, y_max] format.
-    """
 
-    # 1. Determine the coordinates of the intersection rectangle
-    x_left = max(box1[0], box2[0]) # most right
-    y_top = max(box1[1], box2[1]) # most bottom
-    x_right = min(box1[2], box2[2]) # most left
-    y_bottom = min(box1[3], box2[3]) # most top
 
-    # no intersection at all
-    if x_right < x_left or y_bottom < y_top:
-        return 0.0
+# ======================================================================
+# שלב 2 — מסווג ConvNeXt (best_ckpt.ckpt). נטען בלי pytorch_lightning:
+# בונים convnext_tiny, מחליפים ראש ל-Sequential(Dropout, Linear(.,3)),
+# וטוענים את ה-state_dict (מסירים את הקידומת 'model.' של ה-LightningModule).
+# מחלקות המסווג (לפי ImageFolder, אלפביתי): 0=background, 1=fish, 2=partial_fish.
+# ======================================================================
 
-    # 2. Calculate the area of intersection rectangle
-    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+# Classifier
+def load_convnext_classifier(ckpt_path, device):
+    import torch
+    import torchvision.models as tvm
+    model = tvm.convnext_tiny(weights=None)
+    in_features = model.classifier[2].in_features
+    model.classifier[2] = torch.nn.Sequential(
+        torch.nn.Dropout(p=0.4),
+        torch.nn.Linear(in_features, 3),
+    )
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ck.get("state_dict", ck)
+    # שומרים רק משקולות הרשת (model.*) — מסירים מצבי metrics וכו'
+    weights = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+    missing, unexpected = model.load_state_dict(weights, strict=False)
+    if missing or unexpected:
+        print(f"[2-STEP] load_state_dict — missing={list(missing)} unexpected={list(unexpected)}")
+    return model.eval().to(device)
 
-    # 3. Calculate individual box areas
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+def _original_stem(stem):
+    """מסיר סיומת Roboflow: 'name_jpg.rf.<hash>' -> 'name'."""
+    return re.sub(r'[_.](?:jpg|jpeg|png)\.rf\.[a-f0-9]+$', '', stem, flags=re.IGNORECASE)
 
-    # 4. Calculate the area of the union
-    union_area = box1_area + box2_area - intersection_area
+def build_orig_lookup(orig_dir):
+    """ממפה stem בסיסי (ללא hash) -> נתיב קובץ, עבור תיקיית התמונות המקוריות."""
+    lookup = {}
+    for f in glob.glob(os.path.join(orig_dir, "*")):
+        if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png"):
+            lookup[_original_stem(os.path.splitext(os.path.basename(f))[0])] = f
+    return lookup
 
-    # Return the ratio (IoU)
-    return intersection_area / union_area
+def expand_box(x1, y1, x2, y2, img_w, img_h, padding):
+    """מרחיב תיבה ב-padding (אחוז מהממדים שלה), חתוך לגבולות התמונה."""
+    bw, bh = x2 - x1, y2 - y1
+    return (max(0, int(x1 - bw * padding)), max(0, int(y1 - bh * padding)),
+            min(img_w, int(x2 + bw * padding)), min(img_h, int(y2 + bh * padding)))
 
-def class_agnostic_nms(boxes, confs, iou_thr=NMS_IOU):
-    """
-    NMS עיוור-למחלקה: ממיין את התיבות לפי confidence מהגבוה לנמוך, שומר את הגבוהה,
-    ומסיר כל תיבה אחרת (ללא קשר למחלקה) שחופפת אותה ב-IoU מעל הסף. חוזר על הנותרות.
-    מחזיר את האינדקסים שנשמרו (במערך המקורי).
-    """
-    n = len(boxes)
-    if n == 0:
+def classify_crops(model, transform, crops, device):
+    """crops: רשימת תמונות BGR (np). מחזיר רשימת (cn_class, confidence).
+    כל crop עובר resize ל-224x224 ואז הטרנספורם של ConvNeXt (כמו באימון)."""
+    import torch
+    from PIL import Image
+    if not crops:
         return []
-    order = list(np.argsort(confs)[::-1])  # אינדקסים לפי confidence יורד
-    keep = []
-    while order:
-        i = order.pop(0)        # התיבה הכי בטוחה שנותרה
-        keep.append(i)
-        # משאירים רק תיבות שלא חופפות אותה מעל הסף
-        order = [j for j in order if calculate_iou(boxes[i], boxes[j]) <= iou_thr]
-    return keep
+    batch = torch.stack([
+        transform(Image.fromarray(cv2.cvtColor(
+            cv2.resize(c, (224, 224), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)))
+        for c in crops
+    ])
+    with torch.no_grad():
+        probs = torch.softmax(model(batch.to(device)), dim=1)
+        conf, pred = probs.max(dim=1)
+    return list(zip(pred.cpu().tolist(), conf.cpu().tolist()))
+
+# Evaluation functions:
 
 def evaluate_class_specific(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=IOU_THRESHOLD):
     """
@@ -228,6 +259,58 @@ def evaluate_class_specific_conf(pred_boxes, pred_classes, gt_boxes, gt_classes,
 
     return image_metrics, pred_statuses
 
+# General purpose funtion:
+
+def calculate_iou(box1, box2):
+    """
+    Calculates the IoU (Intersection over Union) between two bounding boxes
+    in [x_min, y_min, x_max, y_max] format.
+    """
+
+    # 1. Determine the coordinates of the intersection rectangle
+    x_left = max(box1[0], box2[0]) # most right
+    y_top = max(box1[1], box2[1]) # most bottom
+    x_right = min(box1[2], box2[2]) # most left
+    y_bottom = min(box1[3], box2[3]) # most top
+
+    # no intersection at all
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    # 2. Calculate the area of intersection rectangle
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+    # 3. Calculate individual box areas
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    # 4. Calculate the area of the union
+    union_area = box1_area + box2_area - intersection_area
+
+    # Return the ratio (IoU)
+    return intersection_area / union_area
+
+def class_agnostic_nms(boxes, confs, iou_thr=NMS_IOU):
+    """
+    Class-agnostic NMS: Sorts boxes by confidence in descending order, keeps the highest,
+    and removes any other box (regardless of class) that overlaps with it above the IoU threshold.
+    Repeats for the remaining boxes. Returns the indices of the kept boxes.
+    """
+    n = len(boxes)
+    if n == 0:
+        return []
+
+    # Sort indices by confidence in descending order
+    order = list(np.argsort(confs)[::-1])
+    keep = []
+    while order:
+        i = order.pop(0) # Get the remaining box with the highest confidence
+        keep.append(i)
+
+        # Keep only the boxes that do not overlap with it above the threshold
+        order = [j for j in order if calculate_iou(boxes[i], boxes[j]) <= iou_thr]
+    return keep
+
 if __name__ == "__main__":
     if ANALYZE_PREDICT == True:
         current_project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -273,6 +356,18 @@ if __name__ == "__main__":
                                 save_txt=True,
                                 save_conf=True,
                                 project=runs_output_dir)
+
+        # שלב 2 (אם דלוק): טוענים פעם אחת את מסווג ה-ConvNeXt + הטרנספורם + מיפוי התמונות המקוריות
+        if ANALYSE_2_STEP:
+            import torch
+            import torchvision.models as tvm
+            cn_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            convnext = load_convnext_classifier(CKPT_PATH, cn_device)
+            cn_transform = tvm.ConvNeXt_Tiny_Weights.DEFAULT.transforms()
+            orig_lookup = build_orig_lookup(ORIG_IMAGES_DIR)
+            CN_TO_YOLO = {0: None, 1: 0, 2: 1}   # background->drop, fish->0, partial_fish->1
+            print(f"[2-STEP] ConvNeXt נטען (device={cn_device}), {len(orig_lookup)} תמונות מקור מופו")
+
         global_metrics = {
             0: {"tp": 0, "fp": 0, "fn": 0},
             1: {"tp": 0, "fp": 0, "fn": 0}
@@ -313,12 +408,55 @@ if __name__ == "__main__":
             else:
                 orig_h, orig_w = res.orig_shape
 
-            # class-agnostic NMS אחרי ה-detection: מסיר כפילויות חוצות-מחלקה (דג/דג חלקי על אותו אובייקט)
-            if USE_NMS:
+            # class-agnostic NMS אחרי ה-detection (רק במצב חד-שלבי): מסיר כפילויות חוצות-מחלקה.
+            # בדו-שלבי ה-NMS עובר לאחרי הקלאסיפייר (ראה למטה), כדי לדה-דופ לפי ההחלטות המתוקנות.
+            if USE_NMS and not ANALYSE_2_STEP:
                 keep = class_agnostic_nms(raw_boxes, raw_confs, NMS_IOU)
                 raw_boxes = raw_boxes[keep]
                 raw_classes = raw_classes[keep]
                 raw_confs = raw_confs[keep]
+
+            # שלב 2: חיתוך כל גילוי מהתמונה המקורית -> ConvNeXt מסווג מחדש -> שינוי שיוך / השלכת background
+            if ANALYSE_2_STEP:
+                orig_path = orig_lookup.get(_original_stem(img_name))
+                orig_im = cv2.imread(orig_path) if orig_path else None
+                if orig_im is None:
+                    print(f"   ⚠️ [2-STEP] לא נמצאה תמונת מקור ל-{img_name} — משאיר חיזויי YOLO כמו שהם")
+                else:
+                    oh, ow = orig_im.shape[:2]
+                    crops, idxs = [], []
+                    for i in range(len(raw_boxes)):
+                        # raw_boxes ב-640px; מנרמלים (חלוקה ב-orig_w/orig_h=640) וממירים לממדי המקור
+                        x1 = raw_boxes[i, 0] / orig_w * ow
+                        y1 = raw_boxes[i, 1] / orig_h * oh
+                        x2 = raw_boxes[i, 2] / orig_w * ow
+                        y2 = raw_boxes[i, 3] / orig_h * oh
+                        x1, y1, x2, y2 = expand_box(x1, y1, x2, y2, ow, oh, CROP_PADDING)
+                        crop = orig_im[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
+                        crops.append(crop)
+                        idxs.append(i)
+                    preds = classify_crops(convnext, cn_transform, crops, cn_device)
+                    yolo_confs = raw_confs  # שומרים את ה-confidence של YOLO — זה מה שמסננים לפיו
+                    nb, ncl, ncf = [], [], []
+                    for i, (cn_cls, _cn_conf) in zip(idxs, preds):
+                        ycls = CN_TO_YOLO[cn_cls]
+                        if ycls is None:      # background -> משליכים את הגילוי
+                            continue
+                        # ConvNeXt קובע רק את המחלקה; ה-confidence נשאר של YOLO (לא מסננים מחדש)
+                        nb.append(raw_boxes[i]); ncl.append(ycls); ncf.append(yolo_confs[i])
+                    raw_boxes = np.array(nb).reshape(-1, 4)
+                    raw_classes = np.array(ncl, dtype=float)
+                    raw_confs = np.array(ncf, dtype=float)
+
+                # NMS אחרי הקלאסיפייר (בדו-שלבי תמיד אחרי, אם USE_NMS): דה-דופ לפי הזיהויים
+                # המתוקנים (אחרי תיקון מחלקות והשלכת background), לפי ה-confidence של YOLO.
+                if USE_NMS and len(raw_boxes):
+                    keep = class_agnostic_nms(raw_boxes, raw_confs, NMS_IOU)
+                    raw_boxes = raw_boxes[keep]
+                    raw_classes = raw_classes[keep]
+                    raw_confs = raw_confs[keep]
 
             sort_indices = np.argsort(raw_confs)[::-1]
 

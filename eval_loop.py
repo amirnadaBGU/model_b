@@ -12,6 +12,10 @@ ANALYZE_VAL = False
 ANALYZE_PREDICT = True
 ANALYSE_2_STEP = False
 
+# When True: after predicting, run the FULL evaluation (TP/FP/FN, P/R/F1, MAE/MAPE, pixelwise).
+# When False: ONLY predict and save annotated images + label .txt files — use this to LABEL images.
+RUN_EVALUATION = True
+
 # ___Global variables___:
 IOU_THRESHOLD = 0.5 # what counts as match
 CONF = 0.25 # model confidence score
@@ -182,6 +186,62 @@ def evaluate_class_specific(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_
             image_metrics[int(gt_classes[g])]["fn"] += 1
 
     return image_metrics, pred_statuses
+
+def evaluate_class_agnostic(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=IOU_THRESHOLD):
+    """
+    שיוך class-agnostic: חיזוי יכול להתאים ל-GT מכל מחלקה (שיוך לפי IoU בלבד, מהגבוה
+    לנמוך) — בדיוק כמו evaluate_class_specific אך *ללא* איפוס זוגות ממחלקות שונות.
+    בלבול מחלקות נסלח: דג שזוהה כ"חלקי" וחופף ל-GT של דג שלם נחשב התאמה.
+
+    מחזירה fp, fn — מילונים {0,1}:
+      • fp[c] = מספר חיזויים שלא הותאמו לאף GT (גילו רקע), לפי מחלקת *החיזוי*.
+      • fn[c] = מספר אובייקטי GT שלא הותאמו לאף חיזוי (פוספסו), לפי מחלקת ה-*GT*.
+    מ-fp/fn מחושב ה-MAE ה-class-agnostic לכל מחלקה: |fp[c] - fn[c]|.
+    """
+    fp = {0: 0, 1: 0}
+    fn = {0: 0, 1: 0}
+    n_pred = len(pred_boxes)
+    n_gt = len(gt_boxes)
+
+    # מקרי קצה (מחזירים גם קבוצות שיוך ריקות, לחישוב שטחי FP/FN במעלה הזרם)
+    if n_pred == 0:
+        for g_cls in gt_classes:
+            fn[int(g_cls)] += 1
+        return fp, fn, set(), set()
+    if n_gt == 0:
+        for p_cls in pred_classes:
+            fp[int(p_cls)] += 1
+        return fp, fn, set(), set()
+
+    # מטריצת IoU בין כל GT (שורות) לכל חיזוי (עמודות) — בלי מסכת correct_class
+    iou = np.zeros((n_gt, n_pred))
+    for g in range(n_gt):
+        for p in range(n_pred):
+            iou[g, p] = calculate_iou(pred_boxes[p], gt_boxes[g])
+
+    matched_gt = set()
+    matched_pred = set()
+
+    # כל הזוגות מעל הסף, ממוינים מהגבוה לנמוך, ואז ייחוד לפי חיזוי ואז לפי GT (כמו match_predictions)
+    cand = np.argwhere(iou >= iou_threshold)  # [gt_idx, pred_idx]
+    if len(cand) > 0:
+        order = iou[cand[:, 0], cand[:, 1]].argsort()[::-1]
+        cand = cand[order]
+        cand = cand[np.unique(cand[:, 1], return_index=True)[1]]  # חיזוי יחיד לכל חיזוי
+        cand = cand[np.unique(cand[:, 0], return_index=True)[1]]  # GT יחיד לכל GT
+        for g_idx, p_idx in cand:
+            matched_gt.add(int(g_idx))
+            matched_pred.add(int(p_idx))
+
+    # חיזויים שלא שויכו => FP לפי מחלקת החיזוי
+    for p in range(n_pred):
+        if p not in matched_pred:
+            fp[int(pred_classes[p])] += 1
+    # GT שלא שויכו => FN לפי מחלקת ה-GT
+    for g in range(n_gt):
+        if g not in matched_gt:
+            fn[int(gt_classes[g])] += 1
+    return fp, fn, matched_pred, matched_gt
 
 def evaluate_class_specific_conf(pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=IOU_THRESHOLD):
     """
@@ -356,8 +416,12 @@ if __name__ == "__main__":
                                 save_conf=True,
                                 project=runs_output_dir)
 
+        if not RUN_EVALUATION:
+            print(f"\n[PREDICT-ONLY] RUN_EVALUATION=False — בוצעה פרדיקציה בלבד. "
+                  f"התמונות המסומנות וקבצי התיוג (.txt) נשמרו תחת: {runs_output_dir}. דילוג על ההערכה.")
+
         # שלב 2 (אם דלוק): טוענים פעם אחת את מסווג ה-ConvNeXt + הטרנספורם + מיפוי התמונות המקוריות
-        if ANALYSE_2_STEP:
+        if ANALYSE_2_STEP and RUN_EVALUATION:
             import torch
             import torchvision.models as tvm
             cn_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -379,8 +443,33 @@ if __name__ == "__main__":
         count_ape = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |נספרו - GT| / GT לתמונה (ל-MAPE)
         count_ape_n = {0: 0, 1: 0, "total": 0}       # מס' תמונות עם GT>0 (מכנה ה-MAPE, מדלג על חלוקה ב-0)
 
+        # מוני ספירה class-agnostic (שיוך לפי IoU בלבד; בלבול מחלקות נסלח, FP לפי מחלקת החיזוי)
+        count_abs_ca = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |FP - FN| לתמונה (MAE)
+        count_ape_ca = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |FP - FN| / GT לתמונה (MAPE)
+        count_ape_ca_n = {0: 0, 1: 0, "total": 0}       # מס' תמונות עם GT>0 (מכנה ה-MAPE)
+
+        # MAPE PIXELWISE (class-agnostic): כמו ה-MAPE לעיל, אך כל אובייקט נשקל לפי שטח התיבה (פיקסלים)
+        # במקום להיספר כ-1. net = |שטח FP - שטח FN| / GT ; under = שטח FN / GT ; over = שטח FP / GT.
+        count_ape_px = {0: 0.0, 1: 0.0, "total": 0.0}     # net (|over-under|) per-image
+        count_ape_px_u = {0: 0.0, 1: 0.0, "total": 0.0}   # under-count (פספוס שטח) per-image
+        count_ape_px_o = {0: 0.0, 1: 0.0, "total": 0.0}   # over-count  (עודף שטח)  per-image
+        count_ape_px_n = {0: 0, 1: 0, "total": 0}
+
+        # סכומי שטח גלובליים (מאוגדים על כל התמונות יחד, micro-average) — שבר פספוס/עודף נקי,
+        # ללא קיזוז וללא מיצוע per-image: under-count = Σשטח_FN/Σשטח_GT, over-count = Σשטח_FP/Σשטח_GT
+        px_gt_sum = {0: 0.0, 1: 0.0, "total": 0.0}
+        px_fn_sum = {0: 0.0, 1: 0.0, "total": 0.0}
+        px_fp_sum = {0: 0.0, 1: 0.0, "total": 0.0}
+
+        # כיסוי פיקסלי ברמת מסכה (ללא סף בינארי): כמה מפיקסלי ה-GT באמת מכוסים ע"י חיזוי.
+        # cov_tp[c] = פיקסלי GT ממחלקה c שמכוסים ע"י תיבת חיזוי כלשהי (class-agnostic, רק האזור החופף).
+        # cov_gt[c] = סך פיקסלי ה-GT ממחלקה c. cov_fp = פיקסלי חיזוי מחוץ לכל GT (עודף אמיתי).
+        cov_tp = {0: 0, 1: 0, "total": 0}
+        cov_gt = {0: 0, 1: 0, "total": 0}
+        cov_fp = 0
+
         class_names = {0: "Fish", 1: "Partial"}
-        for res in results:
+        for res in (results if RUN_EVALUATION else []):
             img_name = os.path.splitext(os.path.basename(res.path))[0]
             # במצב val-preprocess מציירים ומתייגים על התמונה המקורית (640), לא על ה-letterbox (672)
             if USE_VAL_PREPROCESS:
@@ -514,6 +603,88 @@ if __name__ == "__main__":
             if (gf + gp) > 0:
                 count_ape["total"] += abs((pf + pp) - (gf + gp)) / (gf + gp); count_ape_n["total"] += 1
 
+            # ספירה class-agnostic: שיוך לפי IoU בלבד -> MAE/MAPE לכל מחלקה = |FP - FN|
+            ca_fp, ca_fn, ca_matched_pred, ca_matched_gt = evaluate_class_agnostic(
+                pred_boxes, pred_classes, gt_boxes, gt_classes, iou_threshold=0.5)
+            err_ca_fish = abs(ca_fp[0] - ca_fn[0])
+            err_ca_part = abs(ca_fp[1] - ca_fn[1])
+            err_ca_total = abs((ca_fp[0] + ca_fp[1]) - (ca_fn[0] + ca_fn[1]))
+            count_abs_ca[0] += err_ca_fish
+            count_abs_ca[1] += err_ca_part
+            count_abs_ca["total"] += err_ca_total
+            if gf > 0:
+                count_ape_ca[0] += err_ca_fish / gf;            count_ape_ca_n[0] += 1
+            if gp > 0:
+                count_ape_ca[1] += err_ca_part / gp;            count_ape_ca_n[1] += 1
+            if (gf + gp) > 0:
+                count_ape_ca["total"] += err_ca_total / (gf + gp); count_ape_ca_n["total"] += 1
+
+            # MAPE PIXELWISE: אותו שיוך class-agnostic, אך משוקלל לפי שטח התיבה (פיקסלים).
+            # שטח FN = שטח אובייקטי GT שפוספסו, שטח FP = שטח חיזויים שגילו רקע (לפי מחלקת החיזוי).
+            gt_area_c = {0: 0.0, 1: 0.0}; fn_area_c = {0: 0.0, 1: 0.0}; fp_area_c = {0: 0.0, 1: 0.0}
+            for g in range(len(gt_boxes)):
+                a = max(0.0, float(gt_boxes[g][2] - gt_boxes[g][0])) * max(0.0, float(gt_boxes[g][3] - gt_boxes[g][1]))
+                c = int(gt_classes[g]); gt_area_c[c] += a
+                if g not in ca_matched_gt:
+                    fn_area_c[c] += a
+            for p in range(len(pred_boxes)):
+                if p not in ca_matched_pred:
+                    a = max(0.0, float(pred_boxes[p][2] - pred_boxes[p][0])) * max(0.0, float(pred_boxes[p][3] - pred_boxes[p][1]))
+                    fp_area_c[int(pred_classes[p])] += a
+            perr_fish = abs(fp_area_c[0] - fn_area_c[0])
+            perr_part = abs(fp_area_c[1] - fn_area_c[1])
+            perr_total = abs((fp_area_c[0] + fp_area_c[1]) - (fn_area_c[0] + fn_area_c[1]))
+            ga_tot = gt_area_c[0] + gt_area_c[1]
+            if gt_area_c[0] > 0:
+                count_ape_px[0] += perr_fish / gt_area_c[0]
+                count_ape_px_u[0] += fn_area_c[0] / gt_area_c[0]
+                count_ape_px_o[0] += fp_area_c[0] / gt_area_c[0]
+                count_ape_px_n[0] += 1
+            if gt_area_c[1] > 0:
+                count_ape_px[1] += perr_part / gt_area_c[1]
+                count_ape_px_u[1] += fn_area_c[1] / gt_area_c[1]
+                count_ape_px_o[1] += fp_area_c[1] / gt_area_c[1]
+                count_ape_px_n[1] += 1
+            if ga_tot > 0:
+                count_ape_px["total"] += perr_total / ga_tot
+                count_ape_px_u["total"] += (fn_area_c[0] + fn_area_c[1]) / ga_tot
+                count_ape_px_o["total"] += (fp_area_c[0] + fp_area_c[1]) / ga_tot
+                count_ape_px_n["total"] += 1
+
+            # סכומי שטח גלובליים (לשבר פספוס/עודף מאוגד על כל הסט)
+            for c in (0, 1):
+                px_gt_sum[c] += gt_area_c[c]; px_fn_sum[c] += fn_area_c[c]; px_fp_sum[c] += fp_area_c[c]
+            px_gt_sum["total"] += ga_tot
+            px_fn_sum["total"] += fn_area_c[0] + fn_area_c[1]
+            px_fp_sum["total"] += fp_area_c[0] + fp_area_c[1]
+
+            # כיסוי פיקסלי ברמת מסכה: מציירים את כל תיבות ה-GT (לפי מחלקה) ואת כל תיבות החיזוי
+            # (class-agnostic) על רשת הפיקסלים, וסופרים חיתוך/חוסר/עודף — ללא סף בינארי. כך תיבה
+            # מותאמת אך גדולה/קטנה מדי כבר *לא* נחשבת מושלמת: העודף נכנס ל-FP, החוסר ל-FN.
+            Hh, Ww = int(orig_h), int(orig_w)
+            pred_mask = np.zeros((Hh, Ww), dtype=bool)
+            for p in range(len(pred_boxes)):
+                x1 = max(0, int(round(pred_boxes[p][0]))); y1 = max(0, int(round(pred_boxes[p][1])))
+                x2 = min(Ww, int(round(pred_boxes[p][2]))); y2 = min(Hh, int(round(pred_boxes[p][3])))
+                if x2 > x1 and y2 > y1:
+                    pred_mask[y1:y2, x1:x2] = True
+            gt_mask_all = np.zeros((Hh, Ww), dtype=bool)
+            for c in (0, 1):
+                gt_mask_c = np.zeros((Hh, Ww), dtype=bool)
+                for g in range(len(gt_boxes)):
+                    if int(gt_classes[g]) != c:
+                        continue
+                    x1 = max(0, int(round(gt_boxes[g][0]))); y1 = max(0, int(round(gt_boxes[g][1])))
+                    x2 = min(Ww, int(round(gt_boxes[g][2]))); y2 = min(Hh, int(round(gt_boxes[g][3])))
+                    if x2 > x1 and y2 > y1:
+                        gt_mask_c[y1:y2, x1:x2] = True
+                gt_n = int(gt_mask_c.sum())
+                tp_n = int((gt_mask_c & pred_mask).sum())
+                cov_gt[c] += gt_n; cov_tp[c] += tp_n
+                cov_gt["total"] += gt_n; cov_tp["total"] += tp_n
+                gt_mask_all |= gt_mask_c
+            cov_fp += int((pred_mask & ~gt_mask_all).sum())  # פיקסלי חיזוי מחוץ לכל GT
+
             # ===================================================================
             # 🎨 חלק גראפי חסין קצוות: מניעת התנגשויות + הגבלת גבולות תמונה מוחלטת
             # ===================================================================
@@ -642,33 +813,48 @@ if __name__ == "__main__":
         # ===================================================================
         # 🏆 בלוק סיכום סופי חגיגי מחוץ ללולאה 🏆
         # ===================================================================
-        print("\n" + "=" * 60)
-        print(f" 📊 דוח סיכום סופי - מוד עבודה: {MODE} 📊")
-        print("=" * 60)
+        if RUN_EVALUATION:
+            print("\n" + "=" * 60)
+            print(f" 📊 דוח סיכום סופי - מוד עבודה: {MODE} 📊")
+            print("=" * 60)
 
-        class_labels = {0: "FISH (דג שלם)", 1: "PARTIAL FISH (דג חלקי)"}
+            class_labels = {0: "FISH (דג שלם)", 1: "PARTIAL FISH (דג חלקי)"}
 
-        for c in [0, 1]:
-            tp = global_metrics[c]["tp"]
-            fp = global_metrics[c]["fp"]
-            fn = global_metrics[c]["fn"]
+            per_class_pr = {}  # c -> (precision, recall, f1) לחישוב שורת "all" המשולבת
+            for c in [0, 1]:
+                tp = global_metrics[c]["tp"]
+                fp = global_metrics[c]["fp"]
+                fn = global_metrics[c]["fn"]
 
-            # חישוב המדדים הנגזרים (עם הגנה מפני חלוקה באפס)
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                # חישוב המדדים הנגזרים (עם הגנה מפני חלוקה באפס)
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                per_class_pr[c] = (precision, recall, f1_score)
 
-            print(f"\n🐟 מחלקה {c}: {class_labels[c]}")
-            print(f"   🔹 סך הכל True Positives  (TP): {tp}")
-            print(f"   🔹 סך הכל False Positives (FP): {fp}")
-            print(f"   🔹 סך הכל False Negatives (FN): {fn}")
-            print(f"   ----------------------------------")
-            print(f"   📈 Precision (דיוק הזיהוי):      {precision:.4f}")
-            print(f"   📉 Recall (אחוז הגילוי):         {recall:.4f}")
-            print(f"   🏅 F1-Score (מדד משולב):         {f1_score:.4f}")
+                print(f"\n🐟 מחלקה {c}: {class_labels[c]}")
+                print(f"   🔹 סך הכל True Positives  (TP): {tp}")
+                print(f"   🔹 סך הכל False Positives (FP): {fp}")
+                print(f"   🔹 סך הכל False Negatives (FN): {fn}")
+                print(f"   ----------------------------------")
+                print(f"   📈 Precision (דיוק הזיהוי):      {precision:.4f}")
+                print(f"   📉 Recall (אחוז הגילוי):         {recall:.4f}")
+                print(f"   🏅 F1-Score (מדד משולב):         {f1_score:.4f}")
+                print("-" * 45)
+
+            # שורת "all classes" משולבת — macro-average על שתי המחלקות, כמו Ultralytics (שורת 'all'
+            # ב-model.val(): mean precision / mean recall על המחלקות; F1 הכולל = ממוצע ה-F1 הפר-מחלקתי,
+            # כמו עקומת ה-F1 ל-'all classes').
+            p_all = (per_class_pr[0][0] + per_class_pr[1][0]) / 2
+            r_all = (per_class_pr[0][1] + per_class_pr[1][1]) / 2
+            f1_all = (per_class_pr[0][2] + per_class_pr[1][2]) / 2
+            print(f"\n🎯 ALL CLASSES (כל המחלקות יחד, macro-average כמו Ultralytics)")
+            print(f"   📈 Precision (ממוצע מחלקות):     {p_all:.4f}")
+            print(f"   📉 Recall (ממוצע מחלקות):        {r_all:.4f}")
+            print(f"   🏅 F1-Score (ממוצע מחלקות):      {f1_all:.4f}")
             print("-" * 45)
 
-        print("=" * 60)
+            print("=" * 60)
 
         # ===================================================================
         # 🔢 דוח ספירה (MAE) בסף ה-CONF הנוכחי
@@ -691,6 +877,73 @@ if __name__ == "__main__":
             print(f"   📐 MAPE כולל לתמונה:             {mape_total:.2f}%  (על {count_ape_n['total']} תמונות עם GT>0)")
             print(f"   📐 MAPE לדגים שלמים:             {mape_fish:.2f}%  (על {count_ape_n[0]} תמונות עם GT>0)")
             print(f"   📐 MAPE לדגים חלקיים:            {mape_part:.2f}%  (על {count_ape_n[1]} תמונות עם GT>0)")
+            print("=" * 60)
+
+            # ===================================================================
+            # 🔀 דוח ספירה class-agnostic — שיוך לפי IoU בלבד (בלבול מחלקות נסלח)
+            #    MAE/MAPE לכל מחלקה = |FP - FN|; שגיאה רק מ-גילוי רקע (FP) או פספוס (FN)
+            # ===================================================================
+            print(f"\n 🔀 דוח ספירה class-agnostic (שיוך IoU≥0.5, conf={CONF}, NMS={'ON' if USE_NMS else 'OFF'})")
+            print("-" * 45)
+            print(f"   📏 MAE לדגים שלמים  (agnostic): {count_abs_ca[0] / n:.3f}")
+            print(f"   📏 MAE לדגים חלקיים (agnostic): {count_abs_ca[1] / n:.3f}")
+            print(f"   📏 MAE כולל          (agnostic): {count_abs_ca['total'] / n:.3f}")
+            print(f"   ----------------------------------")
+            mape_ca_fish  = (count_ape_ca[0] / count_ape_ca_n[0] * 100) if count_ape_ca_n[0] > 0 else float('nan')
+            mape_ca_part  = (count_ape_ca[1] / count_ape_ca_n[1] * 100) if count_ape_ca_n[1] > 0 else float('nan')
+            mape_ca_total = (count_ape_ca['total'] / count_ape_ca_n['total'] * 100) if count_ape_ca_n['total'] > 0 else float('nan')
+            print(f"   📐 MAPE לדגים שלמים  (agnostic): {mape_ca_fish:.2f}%  (על {count_ape_ca_n[0]} תמונות עם GT>0)")
+            print(f"   📐 MAPE לדגים חלקיים (agnostic): {mape_ca_part:.2f}%  (על {count_ape_ca_n[1]} תמונות עם GT>0)")
+            print(f"   📐 MAPE כולל          (agnostic): {mape_ca_total:.2f}%  (על {count_ape_ca_n['total']} תמונות עם GT>0)")
+            print("=" * 60)
+
+            # ===================================================================
+            # 🟦 MAPE PIXELWISE — שגיאה משוקללת שטח (פיקסלים) במקום ספירת אובייקטים.
+            #    אם הפספוסים הם חלקיקים קטנים, מדד זה יצנח הרבה מתחת ל-MAPE הספירתי.
+            # ===================================================================
+            print(f"\n 🟦 MAPE PIXELWISE class-agnostic (משוקלל שטח, שיוך IoU≥0.5, conf={CONF})")
+            print("-" * 45)
+            print(f"   net=|over-under| | 🔻under=פספוס שטח | 🔺over=עודף שטח  (ממוצע per-image)")
+            for _k, _lbl in ((0, "דגים שלמים "), (1, "דגים חלקיים"), ("total", "כולל       ")):
+                _n = count_ape_px_n[_k]
+                _net = (count_ape_px[_k] / _n * 100) if _n > 0 else float('nan')
+                _und = (count_ape_px_u[_k] / _n * 100) if _n > 0 else float('nan')
+                _ovr = (count_ape_px_o[_k] / _n * 100) if _n > 0 else float('nan')
+                print(f"   📐 {_lbl}: net={_net:6.2f}%  🔻under={_und:6.2f}%  🔺over={_ovr:6.2f}%  (על {_n} תמונות)")
+            print("=" * 60)
+
+            # ===================================================================
+            # 🧮 שבר שטח מאוגד על כל הסט יחד (micro-average) — פספוס ועודף בנפרד, ללא קיזוז.
+            #    under-count = Σ שטח_FN / Σ שטח_GT ; over-count = Σ שטח_FP / Σ שטח_GT
+            # ===================================================================
+            miss_fish = (px_fn_sum[0] / px_gt_sum[0] * 100) if px_gt_sum[0] > 0 else float('nan')
+            miss_part = (px_fn_sum[1] / px_gt_sum[1] * 100) if px_gt_sum[1] > 0 else float('nan')
+            miss_tot  = (px_fn_sum['total'] / px_gt_sum['total'] * 100) if px_gt_sum['total'] > 0 else float('nan')
+            over_fish = (px_fp_sum[0] / px_gt_sum[0] * 100) if px_gt_sum[0] > 0 else float('nan')
+            over_part = (px_fp_sum[1] / px_gt_sum[1] * 100) if px_gt_sum[1] > 0 else float('nan')
+            over_tot  = (px_fp_sum['total'] / px_gt_sum['total'] * 100) if px_gt_sum['total'] > 0 else float('nan')
+            print(f"\n 🧮 שבר שטח מאוגד על כל הסט (Σ שטח, class-agnostic, conf={CONF})")
+            print("-" * 45)
+            print(f"   🔻 שטח דגים שפוספס (under-count) מתוך סך שטח ה-GT:")
+            print(f"        דגים שלמים: {miss_fish:.2f}%   דגים חלקיים: {miss_part:.2f}%   כולל: {miss_tot:.2f}%")
+            print(f"   🔺 שטח רקע שהומצא (over-count) מתוך סך שטח ה-GT:")
+            print(f"        דגים שלמים: {over_fish:.2f}%   דגים חלקיים: {over_part:.2f}%   כולל: {over_tot:.2f}%")
+            print("=" * 60)
+
+            # ===================================================================
+            # 🟩 כיסוי שטח פיקסלי (mask-level, ללא סף) — תומך בטענה "המודל מכסה נכון X% משטח הדגים".
+            #    coverage = ΣTP_px / Σשטח_GT ; חוסר = 100%-coverage ; עודף = פיקסלי חיזוי מחוץ ל-GT.
+            # ===================================================================
+            cov_f = (cov_tp[0] / cov_gt[0] * 100) if cov_gt[0] > 0 else float('nan')
+            cov_p = (cov_tp[1] / cov_gt[1] * 100) if cov_gt[1] > 0 else float('nan')
+            cov_t = (cov_tp['total'] / cov_gt['total'] * 100) if cov_gt['total'] > 0 else float('nan')
+            fp_pct = (cov_fp / cov_gt['total'] * 100) if cov_gt['total'] > 0 else float('nan')
+            print(f"\n 🟩 כיסוי שטח פיקסלי (mask-level, ללא סף, class-agnostic, conf={CONF})")
+            print("-" * 45)
+            print(f"   ✅ שטח דגים שכוסה נכון (coverage = TP/GT):")
+            print(f"        דגים שלמים: {cov_f:.2f}%   דגים חלקיים: {cov_p:.2f}%   כולל: {cov_t:.2f}%")
+            print(f"   🔻 שטח דגים שלא כוסה (חוסר): כולל: {100-cov_t:.2f}%")
+            print(f"   🔺 שטח חיזוי מחוץ לכל דג (עודף) מתוך שטח ה-GT: {fp_pct:.2f}%")
             print("=" * 60)
 
 # Val

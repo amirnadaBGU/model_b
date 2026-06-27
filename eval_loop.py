@@ -18,7 +18,6 @@ CONF = 0.25 # model confidence score
 GRAPHICAL_DEBUG = False # graphical debug
 MODE = 'CLASSIC' #'ADVANCED' # maybe not relevant
 
-
 # When True: PREDICT undergoes the same preprocessing as model.val() — rectangular letterbox to 672
 # (640 native content + gray border, no upscale). When False: standard predict at 640.
 USE_VAL_PREPROCESS = True
@@ -28,7 +27,7 @@ VAL_IMGSZ = 672
 # and keeps only the one with the highest confidence for each object. Crucial for counting
 # (to avoid double-counting the same fish), as the model is end-to-end and does not perform NMS on its own.
 # When False: the output remains AS IS.
-USE_NMS = False
+USE_NMS = True
 NMS_IOU = 0.5  # The IoU threshold above which a box is considered a duplicate and removed
 
 # Two-step pipeline: YOLO -> NMS(per flag) -> crop each detection from the ORIGINAL image
@@ -377,6 +376,8 @@ if __name__ == "__main__":
         count_n_images = 0
         count_abs = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |נספרו - GT| לתמונה
         count_gt = {0: 0, 1: 0}                        # סכום GT לכל מחלקה (לחישוב ממוצע לתמונה)
+        count_ape = {0: 0.0, 1: 0.0, "total": 0.0}   # סכום |נספרו - GT| / GT לתמונה (ל-MAPE)
+        count_ape_n = {0: 0, 1: 0, "total": 0}       # מס' תמונות עם GT>0 (מכנה ה-MAPE, מדלג על חלוקה ב-0)
 
         class_names = {0: "Fish", 1: "Partial"}
         for res in results:
@@ -505,6 +506,13 @@ if __name__ == "__main__":
             count_abs[1] += abs(pp - gp)
             count_abs["total"] += abs((pf + pp) - (gf + gp))
             count_gt[0] += gf; count_gt[1] += gp
+            # MAPE: |נספרו - GT| / GT, רק בתמונות עם GT>0 (מניעת חלוקה באפס)
+            if gf > 0:
+                count_ape[0] += abs(pf - gf) / gf;            count_ape_n[0] += 1
+            if gp > 0:
+                count_ape[1] += abs(pp - gp) / gp;            count_ape_n[1] += 1
+            if (gf + gp) > 0:
+                count_ape["total"] += abs((pf + pp) - (gf + gp)) / (gf + gp); count_ape_n["total"] += 1
 
             # ===================================================================
             # 🎨 חלק גראפי חסין קצוות: מניעת התנגשויות + הגבלת גבולות תמונה מוחלטת
@@ -676,6 +684,13 @@ if __name__ == "__main__":
             print(f"   📏 MAE ממוצע כולל לתמונה:        {count_abs['total'] / n:.3f}")
             print(f"   📏 MAE ממוצע לדגים שלמים:        {count_abs[0] / n:.3f}")
             print(f"   📏 MAE ממוצע לדגים חלקיים:       {count_abs[1] / n:.3f}")
+            print(f"   ----------------------------------")
+            mape_total = (count_ape['total'] / count_ape_n['total'] * 100) if count_ape_n['total'] > 0 else float('nan')
+            mape_fish  = (count_ape[0] / count_ape_n[0] * 100) if count_ape_n[0] > 0 else float('nan')
+            mape_part  = (count_ape[1] / count_ape_n[1] * 100) if count_ape_n[1] > 0 else float('nan')
+            print(f"   📐 MAPE כולל לתמונה:             {mape_total:.2f}%  (על {count_ape_n['total']} תמונות עם GT>0)")
+            print(f"   📐 MAPE לדגים שלמים:             {mape_fish:.2f}%  (על {count_ape_n[0]} תמונות עם GT>0)")
+            print(f"   📐 MAPE לדגים חלקיים:            {mape_part:.2f}%  (על {count_ape_n[1]} תמונות עם GT>0)")
             print("=" * 60)
 
 # Val

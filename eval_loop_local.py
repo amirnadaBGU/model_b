@@ -10,7 +10,7 @@ import re
 # ___What to do___:
 ANALYZE_VAL = False
 ANALYZE_PREDICT = True
-ANALYSE_2_STEP = False
+ANALYSE_2_STEP = True
 
 # When True: after predicting, run the FULL evaluation (TP/FP/FN, P/R/F1, MAE/MAPE, pixelwise).
 # When False: ONLY predict and save annotated images + label .txt files — use this to LABEL images.
